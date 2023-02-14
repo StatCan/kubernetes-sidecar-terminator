@@ -1,9 +1,11 @@
 package sidecarterminator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,6 +21,7 @@ import (
 
 const (
 	SidecarTerminatorContainerNamePrefix = "sidecar-terminator"
+	SidecarTerminatorContainerNameRegex  = "sidecar-terminator-([a-zA-Z0-9-]+)-([0-9]+)"
 )
 
 // SidecarTerminator defines an instance of the sidecar terminator.
@@ -50,6 +53,16 @@ func NewSidecarTerminator(config *rest.Config, clientset *kubernetes.Clientset, 
 	sidecars := map[string]int{}
 	for _, sidecar := range sidecarsstr {
 		comp := strings.Split(sidecar, "=")
+
+		// If the name of the sidecar is too long, we won't be able to generate a
+		// a sidecar container with a name that is a DNS_LABEL of 63 characters
+		// This is optimistic in hoping that 1 digit (0-9, or 10 containers) is enough
+		// to terminate the sidecar.
+		// (length of sidecar name) + (length of prefix) + (2 dashes) + (1 digit)
+		if len([]rune(comp[0]))+len([]rune(SidecarTerminatorContainerNamePrefix))+3 > 63 {
+			return nil, fmt.Errorf("%q sidecar name is too long to be able to create a %s", comp[0], SidecarTerminatorContainerNamePrefix)
+		}
+
 		if len(comp) == 1 {
 			sidecars[comp[0]] = int(syscall.SIGTERM)
 		} else if len(comp) == 2 {
@@ -131,7 +144,7 @@ func (st *SidecarTerminator) terminate(pod *v1.Pod) error {
 
 	// Terminate the sidecar
 	for _, sidecar := range pod.Status.ContainerStatuses {
-		if isSidecarContainer(sidecar.Name, st.sidecars) && sidecar.State.Running != nil && !hasSidecarTerminatorContainer(pod, sidecar) {
+		if isSidecarContainer(sidecar.Name, st.sidecars) && sidecar.State.Running != nil {
 
 			// TODO: Add ability to kill the proper process
 			// May require looking into the OCI image to extract the entrypoint if not
@@ -141,37 +154,89 @@ func (st *SidecarTerminator) terminate(pod *v1.Pod) error {
 				return fmt.Errorf("unable to end sidecar %s in pod %s using shareProcessNamespace", sidecar.Name, podName(pod))
 			}
 
-			klog.Infof("Terminating sidecar %s from %s with signal %d", sidecar.Name, podName(pod), st.sidecars[sidecar.Name])
-
-			securityContext, err := getSidecarSecurityContext(pod, sidecar.Name)
-			if err != nil {
-				klog.Errorf(err.Error())
-				return err
+			if !sidecar.Ready {
+				klog.Infof("%s sidecar is not ready, termination will wait", sidecar.Name)
+				return nil
 			}
 
-			pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, v1.EphemeralContainer{
-				TargetContainerName: sidecar.Name,
-				EphemeralContainerCommon: v1.EphemeralContainerCommon{
-					Name:  generateSidecarTerminatorContainerName(sidecar.Name),
-					Image: st.terminatorImage,
-					Command: []string{
-						"kill",
-					},
-					Args: []string{
-						fmt.Sprintf("-%d", st.sidecars[sidecar.Name]),
-						"1",
-					},
-					ImagePullPolicy: v1.PullAlways,
-					SecurityContext: securityContext,
-				},
-			})
+			// No sidecar-terminator deployed yet
+			if !hasSidecarTerminatorContainer(pod, sidecar) {
+				klog.Infof("Terminating sidecar %s from %s with signal %d", sidecar.Name, podName(pod), st.sidecars[sidecar.Name])
 
-			_, err = st.clientset.CoreV1().Pods(pod.Namespace).UpdateEphemeralContainers(context.TODO(), pod.Name, pod, metav1.UpdateOptions{})
-			if err != nil {
-				return err
+				securityContext, err := getSidecarSecurityContext(pod, sidecar.Name)
+				if err != nil {
+					return err
+				}
+
+				pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, st.generateSidecarTerminatorEphemeralContainer(sidecar, securityContext, 0))
+
+				_, err = st.clientset.CoreV1().Pods(pod.Namespace).UpdateEphemeralContainers(context.TODO(), pod.Name, pod, metav1.UpdateOptions{})
+				if err != nil {
+					klog.Error(err)
+					return err
+				}
+			}
+
+			sidecarTerminatorStatuses := getSidecarTerminatorStatuses(pod.Status.EphemeralContainerStatuses)
+
+			if len(sidecarTerminatorStatuses) > 0 && hasContainersTerminated(sidecarTerminatorStatuses) {
+				mostRecentTerminatorStatus := getMostRecentSidecarTerminatorStatus(sidecarTerminatorStatuses)
+
+				// Has errored out. Print out logs for more context.
+				if mostRecentTerminatorStatus.State.Terminated.ExitCode != 0 {
+					klog.Infof("%s has ended with return code of %d", mostRecentTerminatorStatus.Name, mostRecentTerminatorStatus.State.Terminated.ExitCode)
+					logs, err := st.getContainerLogs(pod, mostRecentTerminatorStatus.Name)
+					if err != nil {
+						klog.Errorf("unable to get logs: %q", err)
+					}
+					// klog.Infof(logs)
+					klog.Infof("outputting logs for %s\n\n%s\n", mostRecentTerminatorStatus.Name, logs)
+				}
 			}
 		}
 	}
 
 	return nil
+}
+
+func (st *SidecarTerminator) generateSidecarTerminatorEphemeralContainer(sidecar v1.ContainerStatus, securityContext *v1.SecurityContext, num int) v1.EphemeralContainer {
+	return v1.EphemeralContainer{
+		TargetContainerName: sidecar.Name,
+		EphemeralContainerCommon: v1.EphemeralContainerCommon{
+			Name:  fmt.Sprintf("%s-%s-%d", SidecarTerminatorContainerNamePrefix, sidecar.Name, num),
+			Image: st.terminatorImage,
+			Command: []string{
+				"kill",
+			},
+			Args: []string{
+				fmt.Sprintf("-%d", st.sidecars[sidecar.Name]),
+				"1",
+			},
+			ImagePullPolicy: v1.PullAlways,
+			// SecurityContext: securityContext,
+		},
+	}
+}
+
+func (st *SidecarTerminator) getContainerLogs(pod *v1.Pod, containerName string) (string, error) {
+	logsRequest := st.clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &v1.PodLogOptions{
+		Container: containerName,
+	})
+
+	podLogs, err := logsRequest.Stream(context.TODO())
+	if err != nil {
+		klog.Fatal("error in opening stream")
+	}
+	defer podLogs.Close()
+
+	buf := new(bytes.Buffer)
+	_, err = io.Copy(buf, podLogs)
+	if err != nil {
+		klog.Errorf("error retrieving logs from container %s in %s/%s", pod.Namespace, pod.Name, containerName)
+		return "", nil
+	}
+
+	logs := buf.String()
+
+	return logs, nil
 }

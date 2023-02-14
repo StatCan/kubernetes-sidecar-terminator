@@ -2,11 +2,16 @@ package sidecarterminator
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// TODO: make this read-only
+// Put into sidecarTerminator struct?
+var sidecarTerminatorNameRegex = regexp.MustCompile(fmt.Sprintf("%s-([a-zA-Z0-9-]+)-([0-9]+)", SidecarTerminatorContainerNamePrefix))
 
 func podName(pod *v1.Pod) string {
 	return fmt.Sprintf("%s/%s", pod.Namespace, pod.Name)
@@ -67,7 +72,7 @@ func isCompleted(pod *v1.Pod, sidecars map[string]int) bool {
 
 func hasSidecarTerminatorContainer(pod *v1.Pod, sidecar v1.ContainerStatus) bool {
 	for _, ephCont := range pod.Spec.EphemeralContainers {
-		if ephCont.Name == generateSidecarTerminatorContainerName(sidecar.Name) {
+		if sidecarTerminatorNameRegex.MatchString(ephCont.Name) {
 			return true
 		}
 	}
@@ -75,8 +80,31 @@ func hasSidecarTerminatorContainer(pod *v1.Pod, sidecar v1.ContainerStatus) bool
 	return false
 }
 
-func generateSidecarTerminatorContainerName(sidecarName string) string {
-	return fmt.Sprintf("%s-%s", SidecarTerminatorContainerNamePrefix, sidecarName)
+func hasContainersTerminated(containerStatuses []v1.ContainerStatus) bool {
+	var terminated = true
+	for _, ephCont := range containerStatuses {
+		terminated = terminated && ephCont.State.Terminated != nil
+	}
+
+	return terminated
+}
+
+func getSidecarTerminatorStatuses(containerStatuses []v1.ContainerStatus) []v1.ContainerStatus {
+	statuses := make([]v1.ContainerStatus, 0, len(containerStatuses))
+	for _, ephemeralContainerStatus := range containerStatuses {
+		if sidecarTerminatorNameRegex.MatchString(ephemeralContainerStatus.Name) {
+			statuses = append(statuses, ephemeralContainerStatus)
+		}
+	}
+	return statuses
+}
+
+func getMostRecentSidecarTerminatorStatus(containerStatuses []v1.ContainerStatus) v1.ContainerStatus {
+	// This is a lazy implementation that assumes the server
+	// returns statuses of containers in order of creation.
+	// May want to use the suffix number of the name to
+	// determine the most recent container.
+	return containerStatuses[len(containerStatuses)-1]
 }
 
 func getSidecarSecurityContext(pod *v1.Pod, sidecar string) (*v1.SecurityContext, error) {

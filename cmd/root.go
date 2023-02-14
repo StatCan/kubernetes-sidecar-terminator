@@ -68,7 +68,6 @@ has completed`,
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// Load the Kubernetes configuration
-		klog.Info("Hello, World!")
 		klog.Infof("Kubeconfig: %q", kubeconfig)
 
 		var err error
