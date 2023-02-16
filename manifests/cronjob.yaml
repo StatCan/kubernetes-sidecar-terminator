@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sidecar-terminator-testing
+  namespace: istio-testing
+spec:
+  schedule: 0 20 * * *
+  startingDeadlineSeconds: 60
+  concurrencyPolicy: Replace
+  suspend: true
+  jobTemplate:
+    spec:
+      parallelism: 1
+      completions: 1
+      activeDeadlineSeconds: 60
+      backoffLimit: 0
+      manualSelector: false
+      template:
+        spec:
+          containers:
+            - name: starboard
+              image: alpine:latest
+              command:
+                - sleep
+              args:
+                - "60"
+              resources: {}
+              terminationMessagePath: /dev/termination-log
+              terminationMessagePolicy: File
+              imagePullPolicy: IfNotPresent
+          restartPolicy: Never
+          terminationGracePeriodSeconds: 30
+          dnsPolicy: ClusterFirst
+          shareProcessNamespace: false
+          securityContext: {}
+          schedulerName: default-scheduler
+          enableServiceLinks: true
+      ttlSecondsAfterFinished: 60
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3

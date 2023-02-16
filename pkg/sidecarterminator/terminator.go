@@ -192,6 +192,9 @@ func (st *SidecarTerminator) terminate(pod *v1.Pod) error {
 					// klog.Infof(logs)
 					klog.Infof("outputting logs for %s\n\n%s\n", mostRecentTerminatorStatus.Name, logs)
 				}
+
+				//TODO: Add retry mechanism for failures or if pod is still running but command was run successfully.
+				//TODO: If configured signal isn't working, final attempt should use a sigkill.
 			}
 		}
 	}
