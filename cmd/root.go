@@ -131,12 +131,7 @@ has completed`,
 			cancel()
 		}()
 
-		resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
-		if err != nil {
-			klog.Fatal(err)
-		}
-
-		if !hasEphemeralContainersResource(resources.APIResources) {
+		if !hasEphemeralContainersResource(client) {
 			klog.Fatal(fmt.Errorf("api server does not have pods/ephemeralcontainers resource"))
 		}
 
@@ -210,8 +205,14 @@ func initConfig() {
 	}
 }
 
-func hasEphemeralContainersResource(resources []metav1.APIResource) bool {
-	for _, resource := range resources {
+// Checks the server to ensure it has ephemeral containers.
+func hasEphemeralContainersResource(client *clientset.Clientset) bool {
+	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
+	if err != nil {
+		klog.Fatal(err)
+	}
+
+	for _, resource := range resources.APIResources {
 		if resource.Name == "pods/ephemeralcontainers" {
 			return true
 		}
