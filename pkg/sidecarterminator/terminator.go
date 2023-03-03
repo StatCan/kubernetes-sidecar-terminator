@@ -23,14 +23,10 @@ const (
 
 // SidecarTerminator defines an instance of the sidecar terminator.
 type SidecarTerminator struct {
-	config    *rest.Config
-	clientset *kubernetes.Clientset
-
-	eventHandler *sidecarTerminatorEventHandler
-
-	terminatorImage string
-	sidecars        map[string]int
-	namespaces      []string
+	clientset       *kubernetes.Clientset // The k8s client.
+	terminatorImage string                // The image to use for terminating the sidecars.
+	sidecars        map[string]int        // A map of sidecar names to process signal interrupt numbers.
+	namespaces      []string              // A list namespaces to monitor. Empty will monitor all namespaces.
 }
 
 // NewSidecarTerminator returns a new SidecarTerminator instance.
@@ -65,7 +61,6 @@ func NewSidecarTerminator(config *rest.Config, clientset *kubernetes.Clientset, 
 	}
 
 	return &SidecarTerminator{
-		config:          config,
 		clientset:       clientset,
 		terminatorImage: terminatorImage,
 		sidecars:        sidecars,
@@ -73,40 +68,10 @@ func NewSidecarTerminator(config *rest.Config, clientset *kubernetes.Clientset, 
 	}, nil
 }
 
-func (st *SidecarTerminator) setupInformerForNamespace(ctx context.Context, namespace string) error {
-	if namespace == v1.NamespaceAll {
-		klog.Info("starting shared informer")
-	} else {
-		klog.Infof("starting shared informer for namespace %q", namespace)
-	}
-
-	factory := informers.NewFilteredSharedInformerFactory(
-		st.clientset,
-		time.Minute*10,
-		namespace,
-		nil,
-	)
-
-	factory.Core().V1().Pods().Informer().AddEventHandler(st.eventHandler)
-	factory.Start(ctx.Done())
-	for _, ok := range factory.WaitForCacheSync(nil) {
-		if !ok {
-			return errors.New("timed out waiting for controller caches to sync")
-		}
-	}
-
-	return nil
-}
-
 // Run runs the sidecar terminator.
-// TODO: Ensure this is only called once..
+// TODO: Ensure this is only called once.
 func (st *SidecarTerminator) Run(ctx context.Context) error {
 	klog.Info("starting sidecar terminator")
-
-	// Setup event handler
-	st.eventHandler = &sidecarTerminatorEventHandler{
-		st: st,
-	}
 
 	// Setup shared informer factory
 	if len(st.namespaces) == 0 {
@@ -123,6 +88,34 @@ func (st *SidecarTerminator) Run(ctx context.Context) error {
 
 	<-ctx.Done()
 	klog.Info("terminating sidecar terminator")
+	return nil
+}
+
+func (st *SidecarTerminator) setupInformerForNamespace(ctx context.Context, namespace string) error {
+	if namespace == v1.NamespaceAll {
+		klog.Info("starting shared informer")
+	} else {
+		klog.Infof("starting shared informer for namespace %q", namespace)
+	}
+
+	factory := informers.NewFilteredSharedInformerFactory(
+		st.clientset,
+		time.Minute*10,
+		namespace,
+		nil,
+	)
+
+	factory.Core().V1().Pods().Informer().AddEventHandler(
+		&sidecarTerminatorEventHandler{
+			st: st,
+		})
+	factory.Start(ctx.Done())
+	for _, ok := range factory.WaitForCacheSync(nil) {
+		if !ok {
+			return errors.New("timed out waiting for controller caches to sync")
+		}
+	}
+
 	return nil
 }
 
@@ -143,6 +136,12 @@ func (st *SidecarTerminator) terminate(pod *v1.Pod) error {
 
 			klog.Infof("Terminating sidecar %s from %s with signal %d", sidecar.Name, podName(pod), st.sidecars[sidecar.Name])
 
+			securityContext, err := getSidecarSecurityContext(pod, sidecar.Name)
+			if err != nil {
+				klog.Errorf(err.Error())
+				return err
+			}
+
 			pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, v1.EphemeralContainer{
 				TargetContainerName: sidecar.Name,
 				EphemeralContainerCommon: v1.EphemeralContainerCommon{
@@ -156,10 +155,11 @@ func (st *SidecarTerminator) terminate(pod *v1.Pod) error {
 						"1",
 					},
 					ImagePullPolicy: v1.PullAlways,
+					SecurityContext: securityContext,
 				},
 			})
 
-			_, err := st.clientset.CoreV1().Pods(pod.Namespace).UpdateEphemeralContainers(context.TODO(), pod.Name, pod, metav1.UpdateOptions{})
+			_, err = st.clientset.CoreV1().Pods(pod.Namespace).UpdateEphemeralContainers(context.TODO(), pod.Name, pod, metav1.UpdateOptions{})
 			if err != nil {
 				return err
 			}

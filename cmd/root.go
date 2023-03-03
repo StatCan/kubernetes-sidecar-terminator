@@ -68,7 +68,6 @@ has completed`,
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// Load the Kubernetes configuration
-		klog.Info("Hello, World!")
 		klog.Infof("Kubeconfig: %q", kubeconfig)
 
 		var err error
@@ -131,6 +130,10 @@ has completed`,
 			klog.Info("received signal, shutting down")
 			cancel()
 		}()
+
+		if !hasEphemeralContainersResource(client) {
+			klog.Fatal(fmt.Errorf("api server does not have pods/ephemeralcontainers resource"))
+		}
 
 		terminator, err := sidecarterminator.NewSidecarTerminator(config, client, terminatorImage, sidecars, namespaces)
 		if err != nil {
@@ -200,4 +203,19 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
 	}
+}
+
+// Checks the server to ensure it has ephemeral containers.
+func hasEphemeralContainersResource(client *clientset.Clientset) bool {
+	resources, err := client.Discovery().ServerResourcesForGroupVersion("v1")
+	if err != nil {
+		klog.Fatal(err)
+	}
+
+	for _, resource := range resources.APIResources {
+		if resource.Name == "pods/ephemeralcontainers" {
+			return true
+		}
+	}
+	return false
 }
