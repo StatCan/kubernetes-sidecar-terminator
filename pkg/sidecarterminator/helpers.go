@@ -23,6 +23,11 @@ func isOwnedByJob(references []metav1.OwnerReference) bool {
 		if strings.HasPrefix(ref.APIVersion, "argoproj.io/") && ref.Kind == "Workflow" {
 			return true
 		}
+
+		// Spark Applications
+		if strings.HasPrefix(ref.APIVersion, "sparkoperator.k8s.io/") && ref.Kind == "SparkApplication" {
+			return true
+		}
 	}
 
 	return false
